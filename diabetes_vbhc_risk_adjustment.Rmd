@@ -1,0 +1,689 @@
+---
+title: "VBHC Risk Adjustment — Diabetic Patient Readmission"
+author: "Mohammed Asiri"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    code_folding: show
+--- 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  fig.align  = "center"
+)
+```
+
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(naniar)      # missing values visualization
+library(DataExplorer)
+library(ggplot2)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(gridExtra)
+```
+
+```{r load-data, message=FALSE, warning=FALSE}
+df <- read_csv("diabetic_data.csv")
+
+# ── Dimensions ───────────────────────────────────────────────
+dim(df)
+
+# ── First look ───────────────────────────────────────────────
+glimpse(df)
+
+# ── First 6 rows ─────────────────────────────────────────────
+head(df)
+```
+
+```{r missing-values, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+# ── Replace "?" with NA ──────────────────────────────────────
+df <- df %>%
+  mutate(across(where(is.character), ~na_if(., "?")))
+
+# ── Missing values summary ───────────────────────────────────
+missing_summary <- df %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(),
+               names_to  = "Variable",
+               values_to = "Missing_N") %>%
+  mutate(Missing_Pct = round(Missing_N / nrow(df) * 100, 1)) %>%
+  filter(Missing_N > 0) %>%
+  arrange(desc(Missing_Pct))
+
+# ── Visual ───────────────────────────────────────────────────
+missing_summary %>%
+  ggplot(aes(x = reorder(Variable, Missing_Pct),
+             y = Missing_Pct,
+             fill = Missing_Pct)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = paste0(Missing_Pct, "%")),
+            hjust = -0.1, size = 4) +
+  coord_flip() +
+  scale_fill_gradient(low = "#F1C40F", high = "#E74C3C") +
+  scale_y_continuous(limits = c(0, 110)) +
+  labs(title    = "Missing Values by Variable",
+       subtitle = paste0("Total rows: ", scales::comma(nrow(df))),
+       x = NULL, y = "Missing (%)") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+```{r data-cleaning, message=FALSE, warning=FALSE}
+# ── Drop columns: excessive missing or no analytical value ───
+df_clean <- df %>%
+  select(-weight, -payer_code, -medical_specialty,
+         -encounter_id, -patient_nbr)
+
+# ── Convert to factors ───────────────────────────────────────
+df_clean <- df_clean %>%
+  mutate(
+    readmitted    = factor(readmitted,
+                           levels = c("NO", ">30", "<30")),
+    gender        = factor(gender),
+    race          = factor(race),
+    age           = factor(age,
+                           levels = c("[0-10)","[10-20)","[20-30)",
+                                      "[30-40)","[40-50)","[50-60)",
+                                      "[60-70)","[70-80)","[80-90)",
+                                      "[90-100)")),
+    change        = factor(change),
+    diabetesMed   = factor(diabetesMed),
+    A1Cresult     = factor(A1Cresult),
+    max_glu_serum = factor(max_glu_serum),
+
+    # ── Binary target: readmitted within 30 days ─────────────
+    readmitted_30 = factor(ifelse(readmitted == "<30", 1, 0),
+                           levels = c(0, 1),
+                           labels = c("No", "Yes"))
+  )
+
+# ── Confirm final shape ──────────────────────────────────────
+cat("Rows:   ", nrow(df_clean), "\n")
+cat("Columns:", ncol(df_clean), "\n")
+```
+
+```{r target-variable, message=FALSE, warning=FALSE, fig.width=10, fig.height=5}
+# ── Original 3-class distribution ────────────────────────────
+p1 <- df_clean %>%
+  count(readmitted) %>%
+  mutate(Pct = round(n / sum(n) * 100, 1)) %>%
+  ggplot(aes(x = readmitted, y = n, fill = readmitted)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_label(aes(label = paste0(n, "\n(", Pct, "%)")),
+             size = 4.5, fontface = "bold") +
+  scale_fill_manual(values = c("NO"  = "#2ECC71",
+                                ">30" = "#F39C12",
+                                "<30" = "#E74C3C")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Original: 3-Class Distribution",
+       x = "Readmission Status", y = "Count") +
+  theme_minimal(base_size = 13)
+
+# ── Binary target distribution ────────────────────────────────
+p2 <- df_clean %>%
+  count(readmitted_30) %>%
+  mutate(Pct = round(n / sum(n) * 100, 1)) %>%
+  ggplot(aes(x = readmitted_30, y = n, fill = readmitted_30)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_label(aes(label = paste0(n, "\n(", Pct, "%)")),
+             size = 4.5, fontface = "bold") +
+  scale_fill_manual(values = c("No" = "#2ECC71", "Yes" = "#E74C3C")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Binary Target: Readmitted within 30 Days",
+       x = "Readmitted <30 Days", y = "Count") +
+  theme_minimal(base_size = 13)
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+```{r numerical-distribution, message=FALSE, warning=FALSE, fig.width=12, fig.height=10}
+# ── Select numerical variables ────────────────────────────────
+num_vars <- c("time_in_hospital", "num_lab_procedures",
+              "num_procedures",   "num_medications",
+              "number_outpatient","number_emergency",
+              "number_inpatient", "number_diagnoses")
+
+# ── Distribution by binary target ────────────────────────────
+df_clean %>%
+  select(all_of(num_vars), readmitted_30) %>%
+  pivot_longer(-readmitted_30,
+               names_to  = "Variable",
+               values_to = "Value") %>%
+  ggplot(aes(x = Value, fill = readmitted_30)) +
+  geom_histogram(bins = 30, alpha = 0.7,
+                 position = "identity") +
+  facet_wrap(~Variable, scales = "free", ncol = 2) +
+  scale_fill_manual(values = c("No"  = "#2ECC71",
+                                "Yes" = "#E74C3C")) +
+  labs(title    = "Numerical Variables Distribution by Readmission",
+       subtitle = "Green = Not readmitted within 30d | Red = Readmitted within 30d",
+       x        = NULL,
+       y        = "Count",
+       fill     = "Readmitted <30d") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+```
+
+```{r categorical-distribution, message=FALSE, warning=FALSE, fig.width=12, fig.height=14}
+# ── Key categorical variables ─────────────────────────────────
+cat_vars <- c("race", "gender", "age",
+              "A1Cresult", "max_glu_serum",
+              "diabetesMed", "change")
+
+# ── Plot each variable vs binary target ──────────────────────
+plots <- lapply(cat_vars, function(var) {
+  df_clean %>%
+    filter(!is.na(.data[[var]])) %>%
+    count(.data[[var]], readmitted_30) %>%
+    group_by(.data[[var]]) %>%
+    mutate(Pct = round(n / sum(n) * 100, 1)) %>%
+    filter(readmitted_30 == "Yes") %>%
+    ggplot(aes(x = reorder(.data[[var]], Pct),
+               y = Pct,
+               fill = Pct)) +
+    geom_col(width = 0.7, show.legend = FALSE) +
+    geom_text(aes(label = paste0(Pct, "%")),
+              hjust = -0.1, size = 3.5) +
+    coord_flip() +
+    scale_fill_gradient(low = "#F1C40F", high = "#E74C3C") +
+    scale_y_continuous(limits = c(0, 25)) +
+    labs(title = paste("Readmission Rate by", var),
+         x = NULL, y = "% Readmitted <30d") +
+    theme_minimal(base_size = 11)
+})
+
+gridExtra::grid.arrange(grobs = plots, ncol = 2)
+```
+```{r outliers, message=FALSE, warning=FALSE, fig.width=12, fig.height=8}
+# ── Numerical variables ───────────────────────────────────────
+num_vars <- c("time_in_hospital", "num_lab_procedures",
+              "num_procedures",   "num_medications",
+              "number_outpatient","number_emergency",
+              "number_inpatient", "number_diagnoses")
+
+# ── Boxplot to visualize outliers ────────────────────────────
+df_clean %>%
+  select(all_of(num_vars)) %>%
+  pivot_longer(everything(),
+               names_to  = "Variable",
+               values_to = "Value") %>%
+  ggplot(aes(x = Variable, y = Value, fill = Variable)) +
+  geom_boxplot(outlier.colour = "#E74C3C",
+               outlier.size   = 0.8,
+               alpha          = 0.7,
+               show.legend    = FALSE) +
+  facet_wrap(~Variable, scales = "free", ncol = 4) +
+  labs(title    = "Outlier Detection — Numerical Variables",
+       subtitle = "Red dots = outliers (beyond 1.5 × IQR)",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_blank())
+
+# ── IQR summary table ─────────────────────────────────────────
+df_clean %>%
+  select(all_of(num_vars)) %>%
+  pivot_longer(everything(),
+               names_to  = "Variable",
+               values_to = "Value") %>%
+  group_by(Variable) %>%
+  summarise(
+    Min     = min(Value, na.rm = TRUE),
+    Q1      = quantile(Value, 0.25, na.rm = TRUE),
+    Median  = median(Value, na.rm = TRUE),
+    Q3      = quantile(Value, 0.75, na.rm = TRUE),
+    Max     = max(Value, na.rm = TRUE),
+    IQR     = IQR(Value, na.rm = TRUE),
+    Outlier_threshold = round(Q3 + 1.5 * IQR, 1),
+    Outlier_N = sum(Value > Q3 + 1.5 * IQR, na.rm = TRUE),
+    Outlier_Pct = round(Outlier_N / n() * 100, 1)
+  ) %>%
+  arrange(desc(Outlier_Pct))
+```
+```{r correlation, message=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+library(corrplot)
+
+# ── Numerical variables + binary target ──────────────────────
+num_vars <- c("time_in_hospital", "num_lab_procedures",
+              "num_procedures",   "num_medications",
+              "number_outpatient","number_emergency",
+              "number_inpatient", "number_diagnoses")
+
+# ── Correlation matrix ────────────────────────────────────────
+cor_matrix <- df_clean %>%
+  select(all_of(num_vars)) %>%
+  cor(use = "pairwise.complete.obs")
+
+corrplot(cor_matrix,
+         method      = "color",
+         type        = "upper",
+         order       = "hclust",
+         tl.col      = "black",
+         tl.cex      = 0.9,
+         addCoef.col = "black",
+         number.cex  = 0.8,
+         col         = colorRampPalette(c("#2ECC71",
+                                          "white",
+                                          "#E74C3C"))(200),
+         title       = "Correlation Matrix — Numerical Variables",
+         mar         = c(0, 0, 2, 0))
+
+# ── Correlation with target ───────────────────────────────────
+df_clean %>%
+  mutate(target = as.numeric(readmitted_30 == "Yes")) %>%
+  select(all_of(num_vars), target) %>%
+  cor(use = "pairwise.complete.obs") %>%
+  as.data.frame() %>%
+  select(target) %>%
+  rownames_to_column("Variable") %>%
+  filter(Variable != "target") %>%
+  mutate(Correlation = round(target, 3),
+         Direction   = ifelse(target > 0, "Positive", "Negative")) %>%
+  select(-target) %>%
+  arrange(desc(abs(Correlation))) %>%
+  ggplot(aes(x = reorder(Variable, abs(Correlation)),
+             y = Correlation,
+             fill = Direction)) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_text(aes(label = Correlation),
+            hjust = ifelse(df_clean %>%
+                            mutate(target = as.numeric(readmitted_30 == "Yes")) %>%
+                            select(all_of(num_vars), target) %>%
+                            cor(use = "pairwise.complete.obs") %>%
+                            as.data.frame() %>%
+                            select(target) %>%
+                            slice(-n()) %>%
+                            pull(target) > 0, -0.2, 1.2),
+            size = 4) +
+  coord_flip() +
+  scale_fill_manual(values = c("Positive" = "#E74C3C",
+                                "Negative" = "#2ECC71")) +
+  labs(title    = "Correlation with Target (Readmitted <30d)",
+       subtitle = "Absolute value shows strength of relationship",
+       x = NULL, y = "Correlation") +
+  theme_minimal(base_size = 13)
+```
+```{r feature-engineering, message=FALSE, warning=FALSE}
+# ── Diabetes medication columns ───────────────────────────────
+med_cols <- c("metformin", "repaglinide", "nateglinide",
+              "chlorpropamide", "glimepiride", "acetohexamide",
+              "glipizide", "glyburide", "tolbutamide",
+              "pioglitazone", "rosiglitazone", "acarbose",
+              "miglitol", "troglitazone", "tolazamide",
+              "examide", "citoglipton", "insulin",
+              "glyburide-metformin", "glipizide-metformin",
+              "glimepiride-pioglitazone", "metformin-rosiglitazone",
+              "metformin-pioglitazone")
+
+# ── ICD-9 diagnosis to medical category ──────────────────────
+diag_to_category <- function(diag) {
+  case_when(
+    is.na(diag)                                ~ "Unknown",
+    str_detect(diag, "^250")                   ~ "Diabetes",
+    as.numeric(diag) %in% 390:459 |
+      diag == "785"                            ~ "Circulatory",
+    as.numeric(diag) %in% 460:519 |
+      diag == "786"                            ~ "Respiratory",
+    as.numeric(diag) %in% 520:579 |
+      diag == "787"                            ~ "Digestive",
+    as.numeric(diag) %in% 800:999             ~ "Injury",
+    as.numeric(diag) %in% 710:739             ~ "Musculoskeletal",
+    as.numeric(diag) %in% 580:629             ~ "Genitourinary",
+    as.numeric(diag) %in% 140:239             ~ "Neoplasms",
+    TRUE                                       ~ "Other"
+  )
+}
+
+# ── Build engineered features ─────────────────────────────────
+df_eng <- df_clean %>%
+  mutate(
+    # ── Number of active medications ──────────────────────────
+    num_active_meds = rowSums(
+      across(all_of(med_cols),
+             ~. %in% c("Steady", "Up", "Down")),
+      na.rm = TRUE
+    ),
+
+    # ── Number of medications with dose change ────────────────
+    med_change_count = rowSums(
+      across(all_of(med_cols),
+             ~. %in% c("Up", "Down")),
+      na.rm = TRUE
+    ),
+
+    # ── Primary diagnosis category ────────────────────────────
+    diag1_cat = diag_to_category(diag_1) %>% factor(),
+    diag2_cat = diag_to_category(diag_2) %>% factor(),
+    diag3_cat = diag_to_category(diag_3) %>% factor(),
+
+    # ── Admission type ────────────────────────────────────────
+    admission_type = case_when(
+      admission_type_id == 1 ~ "Emergency",
+      admission_type_id == 2 ~ "Urgent",
+      admission_type_id == 3 ~ "Elective",
+      TRUE                   ~ "Other"
+    ) %>% factor(),
+
+    # ── Discharge disposition ─────────────────────────────────
+    discharge_to = case_when(
+      discharge_disposition_id == 1  ~ "Home",
+      discharge_disposition_id == 2  ~ "Care_Facility",
+      discharge_disposition_id == 3  ~ "Care_Facility",
+      discharge_disposition_id == 6  ~ "Home_Health",
+      discharge_disposition_id == 11 ~ "Deceased",
+      TRUE                           ~ "Other"
+    ) %>% factor(),
+
+    # ── Admission source ──────────────────────────────────────
+    admission_source = case_when(
+      admission_source_id == 1 ~ "Physician_Referral",
+      admission_source_id == 7 ~ "Emergency_Room",
+      admission_source_id == 2 ~ "Clinic_Referral",
+      TRUE                     ~ "Other"
+    ) %>% factor()
+
+  ) %>%
+  # ── Drop original columns now replaced ───────────────────────
+  select(-all_of(med_cols),
+         -diag_1, -diag_2, -diag_3,
+         -admission_type_id,
+         -discharge_disposition_id,
+         -admission_source_id)
+
+# ── Confirm final shape ───────────────────────────────────────
+cat("Rows:   ", nrow(df_eng), "\n")
+cat("Columns:", ncol(df_eng), "\n")
+glimpse(df_eng)
+```
+
+```{r preprocessing, message=FALSE, warning=FALSE}
+library(caret)
+
+# ── Remove original readmitted (keep binary target only) ─────
+df_model <- df_eng %>%
+  select(-readmitted) %>%
+  drop_na()
+
+cat("Final dataset for modeling:\n")
+cat("Rows:   ", nrow(df_model), "\n")
+cat("Columns:", ncol(df_model), "\n")
+
+# ── Train / Test Split 80/20 ─────────────────────────────────
+set.seed(42)
+train_idx <- createDataPartition(df_model$readmitted_30,
+                                 p    = 0.80,
+                                 list = FALSE)
+train_df <- df_model[train_idx, ]
+test_df  <- df_model[-train_idx, ]
+
+# ── Confirm split balance ─────────────────────────────────────
+cat("\nTrain set:\n")
+print(prop.table(table(train_df$readmitted_30)))
+
+cat("\nTest set:\n")
+print(prop.table(table(test_df$readmitted_30)))
+```
+```{r logistic-regression, message=FALSE, warning=FALSE, cache=TRUE}
+# ── Train Logistic Regression ─────────────────────────────────
+lr_model <- glm(
+  readmitted_30 ~ .,
+  data   = train_df,
+  family = binomial(link = "logit")
+)
+
+# ── Predictions on test set ───────────────────────────────────
+lr_prob <- predict(lr_model, newdata = test_df, type = "response")
+
+# ── AUC ──────────────────────────────────────────────────────
+library(pROC)
+roc_lr <- roc(test_df$readmitted_30, lr_prob,
+              levels = c("No", "Yes"),
+              quiet  = TRUE)
+cat("AUC:", round(auc(roc_lr), 4), "\n")
+
+# ── Best threshold ────────────────────────────────────────────
+best_thresh <- coords(roc_lr, "best",
+                      ret         = "threshold",
+                      best.method = "youden")$threshold
+
+cat("Best threshold:", round(best_thresh, 3), "\n")
+
+# ── Confusion Matrix ──────────────────────────────────────────
+lr_pred <- factor(ifelse(lr_prob >= best_thresh, "Yes", "No"),
+                  levels = c("No", "Yes"))
+
+cm_lr <- confusionMatrix(lr_pred,
+                         test_df$readmitted_30,
+                         positive = "Yes")
+print(cm_lr)
+
+# ── Odds Ratios ───────────────────────────────────────────────
+broom::tidy(lr_model, exponentiate = TRUE, conf.int = FALSE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(abs_effect = abs(log(estimate))) %>%
+  arrange(desc(abs_effect)) %>%
+  head(15) %>%
+  ggplot(aes(x = reorder(term, estimate),
+             y = estimate,
+             colour = estimate > 1)) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 1,
+             linetype = "dashed",
+             colour   = "grey50") +
+  coord_flip() +
+  scale_colour_manual(
+    values = c("TRUE"  = "#E74C3C",
+               "FALSE" = "#2ECC71"),
+    labels = c("TRUE"  = "Increases Risk",
+               "FALSE" = "Decreases Risk")
+  ) +
+  labs(title    = "Odds Ratios — Logistic Regression",
+       subtitle = "Top 15 variables by effect size",
+       x = NULL, y = "Odds Ratio", colour = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top")
+
+```
+
+```{r risk-adjustment, message=FALSE, warning=FALSE, cache=TRUE, fig.width=10, fig.height=6}
+# ── Apply model to full dataset ───────────────────────────────
+lr_prob_full <- predict(lr_model,
+                        newdata = df_model,
+                        type    = "response")
+
+# ── Add predictions to dataset ────────────────────────────────
+df_risk <- df_model %>%
+  mutate(
+    predicted_risk = lr_prob_full,
+    observed       = as.numeric(readmitted_30 == "Yes"),
+
+    # ── Risk groups ───────────────────────────────────────────
+    risk_group = case_when(
+      predicted_risk < 0.10 ~ "1. Low (<10%)",
+      predicted_risk < 0.20 ~ "2. Moderate (10-20%)",
+      predicted_risk < 0.30 ~ "3. High (20-30%)",
+      TRUE                  ~ "4. Very High (>30%)"
+    ) %>% factor()
+  )
+
+# ── O/E Ratio by risk group ───────────────────────────────────
+oe_table <- df_risk %>%
+  group_by(risk_group) %>%
+  summarise(
+    N            = n(),
+    Observed     = sum(observed),
+    Expected     = round(sum(predicted_risk), 1),
+    Obs_Rate     = round(mean(observed) * 100, 1),
+    Exp_Rate     = round(mean(predicted_risk) * 100, 1),
+    OE_Ratio     = round(Observed / Expected, 3),
+    .groups      = "drop"
+  ) %>%
+  mutate(
+    Performance = case_when(
+      OE_Ratio < 0.90 ~ "Better than Expected",
+      OE_Ratio > 1.10 ~ "Worse than Expected",
+      TRUE            ~ "As Expected"
+    )
+  )
+
+print(oe_table)
+
+# ── Visual ────────────────────────────────────────────────────
+oe_table %>%
+  ggplot(aes(x = risk_group, y = OE_Ratio, fill = OE_Ratio > 1)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_hline(yintercept = 1, linetype = "dashed",
+             colour = "grey40", linewidth = 1) +
+  geom_text(aes(label = OE_Ratio),
+            vjust = -0.5, size = 4.5, fontface = "bold") +
+  scale_fill_manual(values = c("FALSE" = "#2ECC71",
+                                "TRUE"  = "#E74C3C")) +
+  labs(title    = "O/E Ratio by Risk Group — Logistic Regression",
+       subtitle = "Dashed line = 1.0 | Below = better | Above = worse than expected",
+       x = "Risk Group", y = "O/E Ratio") +
+  theme_minimal(base_size = 13) +
+  ylim(0, max(oe_table$OE_Ratio) + 0.2)
+```
+
+```{r provider-comparison, message=FALSE, warning=FALSE, fig.width=12, fig.height=7}
+# ── O/E by admission_type ─────────────────────────────────────
+provider_table <- df_risk %>%
+  group_by(admission_type) %>%
+  summarise(
+    N              = n(),
+    Crude_Rate     = round(mean(observed) * 100, 1),
+    Expected_Rate  = round(mean(predicted_risk) * 100, 1),
+    Observed_N     = sum(observed),
+    Expected_N     = round(sum(predicted_risk), 1),
+    OE_Ratio       = round(Observed_N / Expected_N, 3),
+    Case_Mix_Index = round(mean(predicted_risk) /
+                           mean(df_risk$predicted_risk), 3),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Performance = case_when(
+      OE_Ratio < 0.90 ~ "🟢 Better than Expected",
+      OE_Ratio > 1.10 ~ "🔴 Worse than Expected",
+      TRUE            ~ "🟡 As Expected"
+    )
+  ) %>%
+  arrange(desc(Crude_Rate))
+
+print(provider_table)
+
+# ── Visual: Crude vs Risk-Adjusted side by side ───────────────
+p1 <- provider_table %>%
+  ggplot(aes(x = reorder(admission_type, Crude_Rate),
+             y = Crude_Rate,
+             fill = Crude_Rate)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = paste0(Crude_Rate, "%")),
+            hjust = -0.2, size = 4) +
+  coord_flip() +
+  scale_fill_gradient(low = "#F1C40F", high = "#E74C3C") +
+  labs(title = "Before Adjustment — Crude Rate",
+       x = NULL, y = "Readmission Rate (%)") +
+  theme_minimal(base_size = 12) +
+  ylim(0, max(provider_table$Crude_Rate) + 3)
+
+p2 <- provider_table %>%
+  ggplot(aes(x = reorder(admission_type, Crude_Rate),
+             y = OE_Ratio,
+             fill = OE_Ratio > 1)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_hline(yintercept = 1, linetype = "dashed",
+             colour = "grey40", linewidth = 1) +
+  geom_text(aes(label = OE_Ratio),
+            hjust = -0.2, size = 4) +
+  coord_flip() +
+  scale_fill_manual(values = c("FALSE" = "#2ECC71",
+                                "TRUE"  = "#E74C3C")) +
+  labs(title = "After Adjustment — O/E Ratio",
+       x = NULL, y = "O/E Ratio") +
+  theme_minimal(base_size = 12) +
+  ylim(0, max(provider_table$OE_Ratio) + 0.2)
+
+p3 <- provider_table %>%
+  ggplot(aes(x = reorder(admission_type, Crude_Rate),
+             y = Case_Mix_Index,
+             fill = Case_Mix_Index)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_hline(yintercept = 1, linetype = "dashed",
+             colour = "grey40") +
+  geom_text(aes(label = Case_Mix_Index),
+            hjust = -0.2, size = 4) +
+  coord_flip() +
+  scale_fill_gradient(low = "#BDC3C7", high = "#2C3E50") +
+  labs(title = "Case Mix Index",
+       subtitle = "Above 1 = sicker patients",
+       x = NULL, y = "CMI") +
+  theme_minimal(base_size = 12) +
+  ylim(0, max(provider_table$Case_Mix_Index) + 0.2)
+
+gridExtra::grid.arrange(p1, p2, p3, ncol = 3,
+  top = "Admission Type: Before vs After Risk Adjustment — VBHC")
+```
+
+```{r final-summary, message=FALSE, warning=FALSE}
+library(pROC)
+
+# ── Model performance summary ─────────────────────────────────
+model_summary <- tibble(
+  Metric = c("AUC", "Sensitivity", "Specificity",
+             "NPV", "Balanced Accuracy", "Threshold"),
+  Value  = c(round(auc(roc_lr), 4),
+             round(cm_lr$byClass["Sensitivity"], 4),
+             round(cm_lr$byClass["Specificity"], 4),
+             round(cm_lr$byClass["Neg Pred Value"], 4),
+             round(cm_lr$byClass["Balanced Accuracy"], 4),
+             round(best_thresh, 3))
+)
+
+cat("═══════════════════════════════════════════════════\n")
+cat("   VBHC Risk Adjustment Report — Diabetes Dataset  \n")
+cat("═══════════════════════════════════════════════════\n\n")
+
+cat("── Dataset ─────────────────────────────────────────\n")
+cat("Total encounters : ", scales::comma(nrow(df_model)), "\n")
+cat("Readmitted <30d  : ", scales::comma(sum(df_model$readmitted_30 == "Yes")),
+    "(", round(mean(df_model$readmitted_30 == "Yes") * 100, 1), "%)\n")
+cat("Features used    :  24\n\n")
+
+cat("── Model: Logistic Regression ──────────────────────\n")
+print(model_summary)
+
+cat("\n── Risk Groups ─────────────────────────────────────\n")
+print(oe_table)
+
+cat("\n── Provider Comparison (Admission Type) ────────────\n")
+print(provider_table %>%
+        select(admission_type, N, Crude_Rate,
+               OE_Ratio, Case_Mix_Index, Performance))
+
+cat("\n── Key Findings ────────────────────────────────────\n")
+cat("1. number_inpatient is the strongest predictor of readmission\n")
+cat("2. age[20-30) has highest OR = ~3.0 — young diabetic patients at high risk\n")
+cat("3. discharge_toHome reduces readmission risk significantly\n")
+cat("4. Emergency appears worst (11.6%) but O/E = 1.0 after adjustment\n")
+cat("5. Moderate risk group (10-20%) is underperforming — O/E = 1.076\n")
+
+cat("\n── Limitations ─────────────────────────────────────\n")
+cat("1. AUC = 0.66 — suitable for group comparison, not individual prediction\n")
+cat("2. No hospital identifier — admission_type used as proxy\n")
+cat("3. Missing data handled by listwise deletion\n")
+cat("4. ICD-9 codes grouped into broad categories — detail may be lost\n")
+cat("═══════════════════════════════════════════════════\n")
+```
